@@ -1,35 +1,91 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "Hello gh-actions-cleanup!"
+days=30
+parallel=10
+apply=false
+repo=""
 
-# Snippets to help get started:
+usage() {
+    cat <<EOF
+Usage:
+  gh actions-cleanup [options]
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+Options:
+  --days N       Delete runs older than N days (default: 30)
+  --parallel N   Parallel deletions (default: 10)
+  --repo OWNER/REPO
+  --apply        Actually delete runs
+  -h, --help
+EOF
+}
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --days)
+            days="$2"
+            shift 2
+            ;;
+        --parallel)
+            parallel="$2"
+            shift 2
+            ;;
+        --repo|-R)
+            repo="$2"
+            shift 2
+            ;;
+        --apply)
+            apply=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+if [[ -z "$repo" ]]; then
+    repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+fi
+
+cutoff=$(date -u -d "$days days ago" '+%Y-%m-%dT%H:%M:%SZ')
+
+mapfile -t run_ids < <(
+    gh run list \
+        --repo "$repo" \
+        --limit 1000 \
+        --json databaseId,createdAt \
+        --jq ".[] | select(.createdAt < \"$cutoff\") | .databaseId"
+)
+
+echo "Repository: $repo"
+echo "Cutoff:     $cutoff"
+echo "Runs:       ${#run_ids[@]}"
+
+if [[ ${#run_ids[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+if [[ "$apply" != true ]]; then
+    printf '%s\n' "${run_ids[@]}"
+    echo
+    echo "Dry-run only. Use --apply to delete."
+    exit 0
+fi
+
+printf '%s\n' "${run_ids[@]}" |
+    xargs -r -n1 -P"$parallel" bash -c '
+        run_id="$1"
+        echo "Deleting run $run_id"
+        gh api \
+            --method DELETE \
+            "repos/'"$repo"'/actions/runs/$run_id"
+    ' _
+
+echo "Deleted ${#run_ids[@]} runs."
