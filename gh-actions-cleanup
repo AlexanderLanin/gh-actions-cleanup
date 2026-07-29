@@ -1,91 +1,393 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
 
-days=30
-parallel=10
-apply=false
-repo=""
+from __future__ import annotations
 
-usage() {
-    cat <<EOF
-Usage:
-  gh actions-cleanup [options]
+import argparse
+import concurrent.futures
+import datetime as dt
+import json
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any
 
-Options:
-  --days N       Delete runs older than N days (default: 30)
-  --parallel N   Parallel deletions (default: 10)
-  --repo OWNER/REPO
-  --apply        Actually delete runs
-  -h, --help
-EOF
-}
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --days)
-            days="$2"
-            shift 2
-            ;;
-        --parallel)
-            parallel="$2"
-            shift 2
-            ;;
-        --repo|-R)
-            repo="$2"
-            shift 2
-            ;;
-        --apply)
-            apply=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown argument: $1" >&2
-            usage >&2
-            exit 2
-            ;;
-    esac
-done
+@dataclass(frozen=True)
+class Run:
+    database_id: int
+    workflow_name: str
+    created_at: dt.datetime
 
-if [[ -z "$repo" ]]; then
-    repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
-fi
 
-cutoff=$(date -u -d "$days days ago" '+%Y-%m-%dT%H:%M:%SZ')
+@dataclass(frozen=True)
+class DeleteResult:
+    run: Run
+    success: bool
+    error: str | None = None
 
-mapfile -t run_ids < <(
-    gh run list \
-        --repo "$repo" \
-        --limit 1000 \
-        --json databaseId,createdAt \
-        --jq ".[] | select(.createdAt < \"$cutoff\") | .databaseId"
-)
 
-echo "Repository: $repo"
-echo "Cutoff:     $cutoff"
-echo "Runs:       ${#run_ids[@]}"
+def run_gh(*args: str) -> str:
+    result = subprocess.run(
+        ["gh", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
-if [[ ${#run_ids[@]} -eq 0 ]]; then
-    exit 0
-fi
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(message or f"gh exited with {result.returncode}")
 
-if [[ "$apply" != true ]]; then
-    printf '%s\n' "${run_ids[@]}"
-    echo
-    echo "Dry-run only. Use --apply to delete."
-    exit 0
-fi
+    return result.stdout
 
-printf '%s\n' "${run_ids[@]}" |
-    xargs -r -n1 -P"$parallel" bash -c '
-        run_id="$1"
-        echo "Deleting run $run_id"
-        gh api \
-            --method DELETE \
-            "repos/'"$repo"'/actions/runs/$run_id"
-    ' _
 
-echo "Deleted ${#run_ids[@]} runs."
+def resolve_repository(repo: str | None) -> str:
+    if repo:
+        return repo
+
+    output = run_gh(
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+        "--jq",
+        ".nameWithOwner",
+    )
+    return output.strip()
+
+
+def parse_timestamp(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def load_runs(repo: str, limit: int, cutoff: dt.datetime) -> list[Run]:
+    # GitHub applies this filter before pagination.  Without it, a busy
+    # repository's newest runs can fill the API's 1,000-result cap and hide
+    # every run eligible for cleanup.
+    created_before = cutoff.astimezone(dt.timezone.utc).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
+    output = run_gh(
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--created",
+        f"<{created_before}",
+        "--limit",
+        str(limit),
+        "--json",
+        "databaseId,createdAt,workflowName",
+    )
+
+    raw_runs: list[dict[str, Any]] = json.loads(output)
+
+    return [
+        Run(
+            database_id=int(item["databaseId"]),
+            workflow_name=item.get("workflowName") or "<unknown workflow>",
+            created_at=parse_timestamp(item["createdAt"]),
+        )
+        for item in raw_runs
+    ]
+
+
+def select_runs(
+    runs: list[Run],
+    cutoff: dt.datetime,
+    keep: int,
+) -> list[Run]:
+    by_workflow: dict[str, list[Run]] = defaultdict(list)
+
+    for run in runs:
+        by_workflow[run.workflow_name].append(run)
+
+    selected: list[Run] = []
+
+    for workflow_runs in by_workflow.values():
+        newest_first = sorted(
+            workflow_runs,
+            key=lambda run: run.created_at,
+            reverse=True,
+        )
+
+        protected_ids = {
+            run.database_id
+            for run in newest_first[:keep]
+        }
+
+        selected.extend(
+            run
+            for run in newest_first
+            if run.database_id not in protected_ids
+            and run.created_at < cutoff
+        )
+
+    return sorted(selected, key=lambda run: run.created_at)
+
+
+def format_date(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def print_summary(runs: list[Run]) -> None:
+    by_workflow: dict[str, list[Run]] = defaultdict(list)
+
+    for run in runs:
+        by_workflow[run.workflow_name].append(run)
+
+    rows: list[tuple[str, str, str, str]] = []
+
+    for workflow, workflow_runs in by_workflow.items():
+        dates = [run.created_at for run in workflow_runs]
+        rows.append(
+            (
+                str(len(workflow_runs)),
+                workflow,
+                format_date(min(dates)),
+                format_date(max(dates)),
+            )
+        )
+
+    rows.sort(key=lambda row: (-int(row[0]), row[1].lower()))
+
+    headers = ("RUNS", "WORKFLOW", "OLDEST", "NEWEST")
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+
+    def print_row(row: tuple[str, str, str, str]) -> None:
+        print(
+            f"{row[0]:>{widths[0]}}  "
+            f"{row[1]:<{widths[1]}}  "
+            f"{row[2]:<{widths[2]}}  "
+            f"{row[3]:<{widths[3]}}"
+        )
+
+    print_row(headers)
+    print(
+        f"{'-' * widths[0]}  "
+        f"{'-' * widths[1]}  "
+        f"{'-' * widths[2]}  "
+        f"{'-' * widths[3]}"
+    )
+
+    for row in rows:
+        print_row(row)
+
+
+def delete_run(repo: str, run: Run) -> DeleteResult:
+    result = subprocess.run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "DELETE",
+            f"repos/{repo}/actions/runs/{run.database_id}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode == 0:
+        return DeleteResult(run=run, success=True)
+
+    error = result.stderr.strip() or result.stdout.strip()
+    return DeleteResult(
+        run=run,
+        success=False,
+        error=error or f"gh exited with {result.returncode}",
+    )
+
+
+def delete_runs(
+    repo: str,
+    runs: list[Run],
+    workers: int,
+) -> list[DeleteResult]:
+    total = len(runs)
+    completed = 0
+    succeeded = 0
+    failed = 0
+    lock = threading.Lock()
+    started = time.monotonic()
+
+    def show_progress() -> None:
+        elapsed = max(time.monotonic() - started, 0.001)
+        rate = completed / elapsed
+
+        print(
+            f"\rProcessed {completed}/{total} "
+            f"({succeeded} deleted, {failed} failed, {rate:.1f}/s)",
+            end="",
+            flush=True,
+        )
+
+    results: list[DeleteResult] = []
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+    ) as executor:
+        futures = [
+            executor.submit(delete_run, repo, run)
+            for run in runs
+        ]
+
+        show_progress()
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+
+            with lock:
+                completed += 1
+
+                if result.success:
+                    succeeded += 1
+                else:
+                    failed += 1
+
+                show_progress()
+
+    print()
+    return results
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+
+    return parsed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Delete old GitHub Actions workflow runs.",
+    )
+
+    parser.add_argument(
+        "--days",
+        type=positive_int,
+        default=30,
+        help="delete runs older than this many days (default: 30)",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=positive_int,
+        default=20,
+        help="number of parallel deletions (default: 20)",
+    )
+    parser.add_argument(
+        "--keep",
+        type=non_negative_int,
+        default=0,
+        help="keep the newest N runs of each workflow (default: 0)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=positive_int,
+        default=1_000,
+        help="maximum eligible runs to inspect (default: 1000)",
+    )
+    parser.add_argument(
+        "-R",
+        "--repo",
+        help="repository in OWNER/REPO format",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show runs without deleting them",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(days=args.days)
+
+    try:
+        repo = resolve_repository(args.repo)
+        runs = load_runs(repo, args.limit, cutoff)
+    except (RuntimeError, json.JSONDecodeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    selected = select_runs(
+        runs=runs,
+        cutoff=cutoff,
+        keep=args.keep,
+    )
+
+    print(f"Repository: {repo}")
+    print(f"Cutoff:     {format_date(cutoff)}")
+    print("Filter:     server-side created-before cutoff")
+    print(f"Keep:       {args.keep} newest run(s) per workflow")
+    print(f"Inspected:  {len(runs)} run(s)")
+    print()
+
+    if not selected:
+        print("No workflow runs match the cleanup criteria.")
+        return 0
+
+    print_summary(selected)
+    print()
+    print(
+        f"{len(selected)} run(s) across "
+        f"{len({run.workflow_name for run in selected})} workflow(s) "
+        f"{'would be deleted' if args.dry_run else 'will be deleted'}."
+    )
+
+    if args.dry_run:
+        return 0
+
+    print()
+    results = delete_runs(
+        repo=repo,
+        runs=selected,
+        workers=args.parallel,
+    )
+
+    failures = [result for result in results if not result.success]
+    deleted = len(results) - len(failures)
+
+    print()
+    print(f"Deleted: {deleted}")
+    print(f"Failed:  {len(failures)}")
+
+    if failures:
+        print("\nFailures:")
+
+        for result in failures:
+            print(
+                f"  {result.run.database_id} "
+                f"({result.run.workflow_name}): "
+                f"{result.error}"
+            )
+
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
